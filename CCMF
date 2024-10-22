@@ -1,0 +1,146 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.models as models
+import torchaudio
+import numpy as np
+
+# Concept Embedding
+class ConceptEmbedding(nn.Module):
+    def __init__(self, vocab_size, embed_dim):
+        super(ConceptEmbedding, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+
+    def forward(self, x):
+        return self.embedding(x)
+
+# Text Encoder
+class TextEncoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim):
+        super(TextEncoder, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
+
+    def forward(self, x):
+        embedded = self.embedding(x)
+        output, (hidden, _) = self.lstm(embedded)
+        return hidden.squeeze(0)
+
+# Image Encoder
+class ImageEncoder(nn.Module):
+    def __init__(self, hidden_dim):
+        super(ImageEncoder, self).__init__()
+        self.resnet = models.resnet18(weights='DEFAULT')  # Updated to use weights argument
+        self.resnet.fc = nn.Linear(self.resnet.fc.in_features, hidden_dim)
+
+    def forward(self, x):
+        return self.resnet(x)
+
+# Audio Encoder
+class AudioEncoder(nn.Module):
+    def __init__(self, hidden_dim):
+        super(AudioEncoder, self).__init__()
+        self.wav2vec = torchaudio.pipelines.WAV2VEC2_BASE.get_model()  # Load the Wav2Vec2 model
+        self.hidden_dim = hidden_dim
+
+    def forward(self, x):
+        # Squeeze the second dimension to convert from [batch_size, 1, sequence_length] to [batch_size, sequence_length]
+        x = x.squeeze(1)  # Remove the second dimension
+        features, _ = self.wav2vec(x)  # Get features from the model
+        last_time_step_features = features[:, -1, :]  # Use the last time step's features
+        return nn.Linear(last_time_step_features.size(1), self.hidden_dim)(last_time_step_features)  # Create the layer dynamically
+
+# Cross-Modal Alignment
+class CrossModalAlignment(nn.Module):
+    def __init__(self, hidden_dim):
+        super(CrossModalAlignment, self).__init__()
+        self.fc = nn.Linear(hidden_dim * 3, hidden_dim)
+
+    def forward(self, text_features, image_features, audio_features):
+        combined = torch.cat((text_features, image_features, audio_features), dim=-1)
+        return self.fc(combined)
+
+# Concept-Guided Attention Mechanism
+class ConceptGuidedAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads):
+        super(ConceptGuidedAttention, self).__init__()
+        self.attention = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+
+    def forward(self, query, key, value):
+        attn_output, _ = self.attention(query, key, value)
+        return attn_output
+
+# CCMF Model
+class CCMFModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_heads):
+        super(CCMFModel, self).__init__()
+        self.text_encoder = TextEncoder(vocab_size, embed_dim, hidden_dim)
+        self.image_encoder = ImageEncoder(hidden_dim)
+        self.audio_encoder = AudioEncoder(hidden_dim)
+        self.cross_modal_alignment = CrossModalAlignment(hidden_dim)
+        self.concept_guided_attention = ConceptGuidedAttention(hidden_dim, num_heads)
+        self.output_layer = nn.Linear(hidden_dim, 1)  # Adjust output size as needed
+
+    def forward(self, text, image, audio):
+        text_features = self.text_encoder(text)
+        image_features = self.image_encoder(image)
+        audio_features = self.audio_encoder(audio)
+        
+        aligned_features = self.cross_modal_alignment(text_features, image_features, audio_features)
+        output = self.concept_guided_attention(aligned_features.unsqueeze(1), aligned_features.unsqueeze(1), aligned_features.unsqueeze(1))
+        return self.output_layer(output.squeeze(1))
+
+# Dataset Class
+class MultimodalDataset(Dataset):
+    def __init__(self, text_data, image_data, audio_data, labels):
+        self.text_data = text_data
+        self.image_data = image_data
+        self.audio_data = audio_data
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        return self.text_data[idx], self.image_data[idx], self.audio_data[idx], self.labels[idx]
+
+# Training Function
+def train_model(model, dataloader, num_epochs, learning_rate, device):
+    model.to(device)
+    criterion = nn.MSELoss()  # Adjust loss function as needed
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        for batch in dataloader:
+            text, image, audio, labels = [item.to(device) for item in batch]
+
+            optimizer.zero_grad()
+            outputs = model(text, image, audio)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+
+# Example Usage
+if __name__ == "__main__":
+    # Example data loading (replace with actual data loading)
+    text_data = torch.randint(0, 10000, (100, 10))  # Example text data
+    image_data = torch.randn(100, 3, 224, 224)  # Example image data
+    audio_data = torch.randn(100, 1, 16000)  # Example audio data
+    labels = torch.randn(100, 1)  # Example labels
+
+    dataset = MultimodalDataset(text_data, image_data, audio_data, labels)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    # Initialize model
+    model = CCMFModel(vocab_size=10000, embed_dim=256, hidden_dim=512, num_heads=8)
+
+    # Train model
+    train_model(model, dataloader, num_epochs=10, learning_rate=0.001, device='cuda' if torch.cuda.is_available() else 'cpu')
